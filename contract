@@ -1,0 +1,320 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+interface IPancakeRouter02 {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+interface IPancakeFactory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+contract OugabugaCoin is IERC20 {
+    string public constant name = "OUGABUGA";
+    string public constant symbol = "OUGA";
+    uint8 public constant decimals = 18;
+    uint256 private _totalSupply = 100_000_000_000 * 10**18; // 100 Billion Initial Supply
+
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    mapping(address => bool) public isExcludedFromFees;
+
+    address public owner;
+    address public founderWallet;
+    address public currentChief;
+    address public tribeGod;
+    address public immutable pancakePair;
+    IPancakeRouter02 public immutable pancakeRouter;
+
+    // King of the Hill & Tribe God Variables
+    uint256 public highestBuyAmount;
+    uint256 public globalHighestBuy;
+    uint256 public chiefRulesUntil;
+    uint256 public constant CHIEF_DURATION = 12 hours;
+
+    // Automated Volcano Mode (Dynamic Panic Tax)
+    uint256 public volcanoModeUntil;
+    uint256 public constant VOLCANO_DURATION = 30 minutes;
+    uint256 public immutable volcanoTriggerAmount = 100_000_000 * 10**18; // 0.1%
+
+    // Supply Stability Limits (The 10% Floor and Balancing System)
+    uint256 public immutable minimumSupplyFloor = 10_000_000_000 * 10**18; // 10 Billion Floor (10%)
+    uint256 public immutable remintActivationZone = 12_000_000_000 * 10**18; // 12 Billion Zone
+
+    // Anti-Whale & Anti-Sniper Settings
+    uint256 public immutable maxWalletAmount = 1_000_000_000 * 10**18; // 1 Billion (1%)
+    uint256 public tradingActiveBlock;
+    uint256 public constant SNIPER_BLOCKS = 5;
+    mapping(address => uint256) private _lastTxBlock;
+
+    // Liquidity Swap Safety Lock
+    bool private inSwap;
+    modifier lockTheSwap() { inSwap = true; _; inSwap = false; }
+
+    struct FeeBreakdown {
+        uint256 founderFee;
+        uint256 dynamicFee;
+        uint256 chiefShare;
+        uint256 godShare;
+        uint256 burnShare;
+        uint256 autonomousMintAmount;
+        uint256 totalFee;
+    }
+
+    struct TradeContext {
+        bool isBuy;
+        bool isSell;
+        uint256 currentMaxBuy;
+        uint256 currentMaxSell;
+    }
+
+    // Events
+    event NewChiefCrowned(address indexed newChief, uint256 amount);
+    event NewTribeGodCrowned(address indexed newGod, uint256 amount);
+    event LuckyBoneWinner(address indexed caveman, uint256 savedTax);
+    event VolcanoTriggered(uint256 activeUntil);
+    event OwnershipRenounced(address indexed previousOwner);
+    event AutonomousTokensReMinted(uint256 mintedAmount, uint256 newTotalSupply);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not the owner");
+        _;
+    }
+
+    constructor(address _founder) {
+        owner = msg.sender;
+        founderWallet = _founder;
+        currentChief = _founder;
+        tribeGod = _founder;
+
+        _balances[msg.sender] = _totalSupply;
+        emit Transfer(address(0), msg.sender, _totalSupply);
+
+        // BSC Mainnet PancakeSwap Router Address
+        IPancakeRouter02 _router = IPancakeRouter02(0x10ED43C718714eb63d5aA57B78B54704E256024E);
+        pancakeRouter = _router;
+        pancakePair = IPancakeFactory(_router.factory()).createPair(address(this), _router.WETH());
+
+        isExcludedFromFees[owner] = true;
+        isExcludedFromFees[_founder] = true;
+        isExcludedFromFees[address(this)] = true;
+    }
+
+    receive() external payable {}
+
+    function totalSupply() external view override returns (uint256) { return _totalSupply; }
+    function balanceOf(address account) external view override returns (uint256) { return _balances[account]; }
+
+    function transfer(address recipient, uint256 amount) external override returns (bool) {
+        _transfer(msg.sender, recipient, amount);
+        return true;
+    }
+
+    function allowance(address ownerAddr, address spender) external view override returns (uint256) {
+        return _allowances[ownerAddr][spender];
+    }
+
+    function approve(address spender, uint256 amount) external override returns (bool) {
+        _allowances[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address sender, address recipient, uint256 amount) external override returns (bool) {
+        uint256 currentAllowance = _allowances[sender][msg.sender];
+        require(currentAllowance >= amount, "ERC20: allowance exceeded");
+        unchecked { _allowances[sender][msg.sender] = currentAllowance - amount; }
+        _transfer(sender, recipient, amount);
+        return true;
+    }
+
+    function isVolcanoModeActive() public view returns (bool) {
+        return block.timestamp < volcanoModeUntil;
+    }
+
+    function getCurrentLimits() public view returns (uint256 maxBuy, uint256 maxSell, string memory eraName) {
+        uint256 poolLiquidity = _balances[pancakePair];
+        if (poolLiquidity > 75_000_000_000 * 10**18) {
+            return (100_000_000 * 10**18, 50_000_000 * 10**18, "Stone Age");
+        } else if (poolLiquidity <= 75_000_000_000 * 10**18 && poolLiquidity > 40_000_000_000 * 10**18) {
+            return (200_000_000 * 10**18, 100_000_000 * 10**18, "Bronze Age");
+        } else {
+            return (_totalSupply, _totalSupply, "Golden Age");
+        }
+    }
+
+    function _checkLimits(uint256 amount, TradeContext memory ctx) internal pure {
+        if (ctx.isBuy) {
+            require(amount <= ctx.currentMaxBuy, "Buy amount exceeds safety limits!");
+        } else {
+            require(amount <= ctx.currentMaxSell, "Sell amount exceeds anti-dump limits!");
+        }
+    }
+
+    function _processFees(address from, address to, uint256 amount) internal returns (uint256) {
+        FeeBreakdown memory fees;
+
+        // Anti-Sniper Check: 99% tax in the first 5 blocks from initialization
+        if (block.number <= tradingActiveBlock + SNIPER_BLOCKS) {
+            fees.totalFee = amount * 99 / 100;
+            _balances[founderWallet] += fees.totalFee;
+            emit Transfer(from, founderWallet, fees.totalFee);
+            return fees.totalFee;
+        }
+
+        fees.founderFee = amount * 1 / 100;
+        uint256 rate = block.timestamp < volcanoModeUntil ? 19 : 4;
+
+        if (block.timestamp % 100 == 69 || block.timestamp % 100 == 20) {
+            emit LuckyBoneWinner(to, amount * rate / 100);
+        } else {
+            fees.dynamicFee = amount * rate / 100;
+        }
+
+        fees.chiefShare = fees.dynamicFee / 2;
+        fees.godShare = fees.dynamicFee * 5 / 100; // 0.5% to Tribe God
+        fees.burnShare = fees.dynamicFee - (fees.chiefShare + fees.godShare);
+
+        if (fees.dynamicFee > 0 && (_totalSupply - fees.burnShare < minimumSupplyFloor)) {
+            fees.chiefShare = fees.dynamicFee - fees.godShare;
+            fees.burnShare = 0;
+        }
+
+        _balances[founderWallet] += fees.founderFee;
+        emit Transfer(from, founderWallet, fees.founderFee);
+
+        uint256 rewardShare = fees.chiefShare + fees.godShare;
+        if (rewardShare > 0) {
+            _balances[address(this)] += rewardShare;
+            emit Transfer(from, address(this), rewardShare);
+        }
+
+        if (fees.burnShare > 0) {
+            _totalSupply -= fees.burnShare;
+            emit Transfer(from, address(0), fees.burnShare);
+        }
+
+        if (_totalSupply <= remintActivationZone && fees.dynamicFee > 0) {
+            fees.autonomousMintAmount = amount * 5 / 10000;
+            _totalSupply += fees.autonomousMintAmount;
+            _balances[currentChief] += fees.autonomousMintAmount;
+            emit Transfer(address(0), currentChief, fees.autonomousMintAmount);
+            emit AutonomousTokensReMinted(fees.autonomousMintAmount, _totalSupply);
+        }
+
+        return fees.founderFee + fees.dynamicFee;
+    }
+
+    function _swapTokensForBNB(uint256 tokenAmount) internal lockTheSwap {
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = pancakeRouter.WETH();
+
+        _allowances[address(this)][address(pancakeRouter)] = tokenAmount;
+
+        uint256 dynamicFee = tokenAmount;
+        uint256 chiefTokens = dynamicFee * 10 / 11;
+        uint256 godTokens = dynamicFee - chiefTokens;
+
+        if (chiefTokens > 0) {
+            pancakeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
+                chiefTokens, 0, path, currentChief, block.timestamp
+            );
+        }
+        if (godTokens > 0) {
+            pancakeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
+                godTokens, 0, path, tribeGod, block.timestamp
+            );
+        }
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal {
+        require(from != address(0) && to != address(0), "Zero address error");
+        require(amount > 0, "Amount must be greater than zero");
+        require(_balances[from] >= amount, "Insufficient balance");
+
+        TradeContext memory ctx;
+        ctx.isBuy = (from == pancakePair);
+        ctx.isSell = (to == pancakePair);
+
+        bool takeFee = (ctx.isBuy || ctx.isSell) && !isExcludedFromFees[from] && !isExcludedFromFees[to];
+
+        if (takeFee) {
+            // Automatically capture the exact launch block on the very first market interaction
+            if (tradingActiveBlock == 0) {
+                tradingActiveBlock = block.number;
+            }
+
+            require(_lastTxBlock[from] < block.number, "One tx per block allowed!");
+            _lastTxBlock[from] = block.number;
+            _lastTxBlock[to] = block.number;
+
+            (ctx.currentMaxBuy, ctx.currentMaxSell,) = getCurrentLimits();
+            _checkLimits(amount, ctx);
+
+            if (ctx.isSell && amount >= volcanoTriggerAmount) {
+                volcanoModeUntil = block.timestamp + VOLCANO_DURATION;
+                emit VolcanoTriggered(volcanoModeUntil);
+            }
+
+            uint256 contractTokenBalance = _balances[address(this)];
+            if (contractTokenBalance > 0 && !inSwap && !ctx.isBuy) {
+                _swapTokensForBNB(contractTokenBalance);
+            }
+
+            _balances[from] -= amount;
+            uint256 totalFee = _processFees(from, to, amount);
+
+            uint256 finalTokens = amount - totalFee;
+            _balances[to] += finalTokens;
+            emit Transfer(from, to, finalTokens);
+
+            if (ctx.isBuy) {
+                if (finalTokens > highestBuyAmount) {
+                    currentChief = to;
+                    highestBuyAmount = finalTokens;
+                    chiefRulesUntil = block.timestamp + CHIEF_DURATION;
+                    emit NewChiefCrowned(to, finalTokens);
+                }
+                if (finalTokens > globalHighestBuy) {
+                    tribeGod = to;
+                    globalHighestBuy = finalTokens;
+                    emit NewTribeGodCrowned(to, finalTokens);
+                }
+            }
+        } else {
+            // Handles fee-free internal wallet routing and original contract pool setups flawlessly
+            _balances[from] -= amount;
+            _balances[to] += amount;
+            emit Transfer(from, to, amount);
+        }
+
+        if (to != pancakePair && !isExcludedFromFees[to]) {
+            require(_balances[to] <= maxWalletAmount, "Max wallet exceeded!");
+        }
+    }
+
+    function renounceOwnership() external onlyOwner {
+        emit OwnershipRenounced(owner);
+        owner = address(0);
+    }
+}
