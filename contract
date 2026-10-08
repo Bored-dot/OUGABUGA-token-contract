@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/* solhint-disable no-unused-vars, max-line-lenght, no-empty-blocks */
+
 interface IERC20 {
     function totalSupply() external view returns (uint256);
     function balanceOf(address account) external view returns (uint256);
@@ -32,7 +34,7 @@ contract OugabugaCoin is IERC20 {
     string public constant name = "OUGABUGA";
     string public constant symbol = "OUGA";
     uint8 public constant decimals = 18;
-    uint256 private _totalSupply = 100_000_000_000 * 10**18; // 100 Billion Initial Supply
+    uint256 private _totalSupply = 100_000_000_000 * 10**18;
 
     mapping(address => uint256) private _balances;
     mapping(address => mapping(address => uint256)) private _allowances;
@@ -54,19 +56,25 @@ contract OugabugaCoin is IERC20 {
     // Automated Volcano Mode (Dynamic Panic Tax)
     uint256 public volcanoModeUntil;
     uint256 public constant VOLCANO_DURATION = 30 minutes;
-    uint256 public immutable volcanoTriggerAmount = 100_000_000 * 10**18; // 0.1%
 
-    // Supply Stability Limits (The 10% Floor and Balancing System)
-    uint256 public immutable minimumSupplyFloor = 10_000_000_000 * 10**18; // 10 Billion Floor (10%)
-    uint256 public immutable remintActivationZone = 12_000_000_000 * 10**18; // 12 Billion Zone
+    // Adjusted to work safely under the Stone Age era limit (40M < 50M max sell)
+    uint256 public immutable volcanoTriggerAmount = 40_000_000 * 10**18;
 
-    // Anti-Whale & Anti-Sniper Settings
-    uint256 public immutable maxWalletAmount = 1_000_000_000 * 10**18; // 1 Billion (1%)
+    // Supply Stability Limits (The 10% Floor System)
+    uint256 public immutable minimumSupplyFloor = 10_000_000_000 * 10**18;
+
+    // Anti-Whale Settings
+    uint256 public immutable maxWalletAmount = 1_000_000_000 * 10**18; // 1%
+
+    bool public tradingActive;
     uint256 public tradingActiveBlock;
     uint256 public constant SNIPER_BLOCKS = 5;
     mapping(address => uint256) private _lastTxBlock;
 
-    // Liquidity Swap Safety Lock
+    // Track accrued internal splits dynamically to avoid execution mathematical errors
+    uint256 public accruedChiefTokens;
+    uint256 public accruedGodTokens;
+
     bool private inSwap;
     modifier lockTheSwap() { inSwap = true; _; inSwap = false; }
 
@@ -76,24 +84,23 @@ contract OugabugaCoin is IERC20 {
         uint256 chiefShare;
         uint256 godShare;
         uint256 burnShare;
-        uint256 autonomousMintAmount;
         uint256 totalFee;
     }
 
     struct TradeContext {
         bool isBuy;
         bool isSell;
+        bool isLiquidityOp;
         uint256 currentMaxBuy;
         uint256 currentMaxSell;
     }
 
-    // Events
     event NewChiefCrowned(address indexed newChief, uint256 amount);
     event NewTribeGodCrowned(address indexed newGod, uint256 amount);
     event LuckyBoneWinner(address indexed caveman, uint256 savedTax);
     event VolcanoTriggered(uint256 activeUntil);
+    event TradingEnabled();
     event OwnershipRenounced(address indexed previousOwner);
-    event AutonomousTokensReMinted(uint256 mintedAmount, uint256 newTotalSupply);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not the owner");
@@ -109,7 +116,7 @@ contract OugabugaCoin is IERC20 {
         _balances[msg.sender] = _totalSupply;
         emit Transfer(address(0), msg.sender, _totalSupply);
 
-        // BSC Mainnet PancakeSwap Router Address
+        // BSC Mainnet Router Address
         IPancakeRouter02 _router = IPancakeRouter02(0x10ED43C718714eb63d5aA57B78B54704E256024E);
         pancakeRouter = _router;
         pancakePair = IPancakeFactory(_router.factory()).createPair(address(this), _router.WETH());
@@ -117,9 +124,18 @@ contract OugabugaCoin is IERC20 {
         isExcludedFromFees[owner] = true;
         isExcludedFromFees[_founder] = true;
         isExcludedFromFees[address(this)] = true;
+        isExcludedFromFees[address(_router)] = true;
+    
     }
 
     receive() external payable {}
+
+    function enableTrading() external onlyOwner {
+        require(!tradingActive, "Trading already active");
+        tradingActive = true;
+        tradingActiveBlock = block.number;
+        emit TradingEnabled();
+    }
 
     function totalSupply() external view override returns (uint256) { return _totalSupply; }
     function balanceOf(address account) external view override returns (uint256) { return _balances[account]; }
@@ -153,9 +169,15 @@ contract OugabugaCoin is IERC20 {
 
     function getCurrentLimits() public view returns (uint256 maxBuy, uint256 maxSell, string memory eraName) {
         uint256 poolLiquidity = _balances[pancakePair];
-        if (poolLiquidity > 75_000_000_000 * 10**18) {
+
+        if (!tradingActive || poolLiquidity == 0) {
             return (100_000_000 * 10**18, 50_000_000 * 10**18, "Stone Age");
-        } else if (poolLiquidity <= 75_000_000_000 * 10**18 && poolLiquidity > 40_000_000_000 * 10**18) {
+        }
+
+        // Adaptive scaling calculated through relative circulation weights to protect 200 EUR initial listings
+        if (poolLiquidity > 20_000_000 * 10**18) {
+            return (100_000_000 * 10**18, 50_000_000 * 10**18, "Stone Age");
+        } else if (poolLiquidity <= 20_000_000 * 10**18 && poolLiquidity > 5_000_000 * 10**18) {
             return (200_000_000 * 10**18, 100_000_000 * 10**18, "Bronze Age");
         } else {
             return (_totalSupply, _totalSupply, "Golden Age");
@@ -164,8 +186,8 @@ contract OugabugaCoin is IERC20 {
 
     function _checkLimits(uint256 amount, TradeContext memory ctx) internal pure {
         if (ctx.isBuy) {
-            require(amount <= ctx.currentMaxBuy, "Buy amount exceeds safety limits!");
-        } else {
+            require(amount <= ctx.currentMaxBuy, "Buy amount exceeds era safety limits!");
+        } else if (ctx.isSell) {
             require(amount <= ctx.currentMaxSell, "Sell amount exceeds anti-dump limits!");
         }
     }
@@ -173,7 +195,6 @@ contract OugabugaCoin is IERC20 {
     function _processFees(address from, address to, uint256 amount) internal returns (uint256) {
         FeeBreakdown memory fees;
 
-        // Anti-Sniper Check: 99% tax in the first 5 blocks from initialization
         if (block.number <= tradingActiveBlock + SNIPER_BLOCKS) {
             fees.totalFee = amount * 99 / 100;
             _balances[founderWallet] += fees.totalFee;
@@ -184,14 +205,16 @@ contract OugabugaCoin is IERC20 {
         fees.founderFee = amount * 1 / 100;
         uint256 rate = block.timestamp < volcanoModeUntil ? 19 : 4;
 
-        if (block.timestamp % 100 == 69 || block.timestamp % 100 == 20) {
+        // Mitigates bot predictability vectors by salting the timestamp check with address variations
+        uint256 pseudoRandomShift = uint256(keccak256(abi.encodePacked(block.timestamp, from, to))) % 100;
+        if (pseudoRandomShift == 69 || pseudoRandomShift == 20) {
             emit LuckyBoneWinner(to, amount * rate / 100);
         } else {
             fees.dynamicFee = amount * rate / 100;
         }
 
-        fees.chiefShare = fees.dynamicFee / 2;
-        fees.godShare = fees.dynamicFee * 5 / 100; // 0.5% to Tribe God
+        fees.chiefShare = (fees.dynamicFee * 50) / 100;
+        fees.godShare = (fees.dynamicFee * 125) / 1000;
         fees.burnShare = fees.dynamicFee - (fees.chiefShare + fees.godShare);
 
         if (fees.dynamicFee > 0 && (_totalSupply - fees.burnShare < minimumSupplyFloor)) {
@@ -205,20 +228,14 @@ contract OugabugaCoin is IERC20 {
         uint256 rewardShare = fees.chiefShare + fees.godShare;
         if (rewardShare > 0) {
             _balances[address(this)] += rewardShare;
+            accruedChiefTokens += fees.chiefShare;
+            accruedGodTokens += fees.godShare;
             emit Transfer(from, address(this), rewardShare);
         }
 
         if (fees.burnShare > 0) {
             _totalSupply -= fees.burnShare;
             emit Transfer(from, address(0), fees.burnShare);
-        }
-
-        if (_totalSupply <= remintActivationZone && fees.dynamicFee > 0) {
-            fees.autonomousMintAmount = amount * 5 / 10000;
-            _totalSupply += fees.autonomousMintAmount;
-            _balances[currentChief] += fees.autonomousMintAmount;
-            emit Transfer(address(0), currentChief, fees.autonomousMintAmount);
-            emit AutonomousTokensReMinted(fees.autonomousMintAmount, _totalSupply);
         }
 
         return fees.founderFee + fees.dynamicFee;
@@ -231,19 +248,32 @@ contract OugabugaCoin is IERC20 {
 
         _allowances[address(this)][address(pancakeRouter)] = tokenAmount;
 
-        uint256 dynamicFee = tokenAmount;
-        uint256 chiefTokens = dynamicFee * 10 / 11;
-        uint256 godTokens = dynamicFee - chiefTokens;
+        uint256 beforeBalance = address(this).balance;
 
-        if (chiefTokens > 0) {
-            pancakeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
-                chiefTokens, 0, path, currentChief, block.timestamp
-            );
-        }
-        if (godTokens > 0) {
-            pancakeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
-                godTokens, 0, path, tribeGod, block.timestamp
-            );
+        pancakeRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount, 0, path, address(this), block.timestamp
+        );
+
+        uint256 gainedBNB = address(this).balance - beforeBalance;
+        if (gainedBNB > 0) {
+            uint256 totalAccrued = accruedChiefTokens + accruedGodTokens;
+
+            if (totalAccrued > 0) {
+                // Dynamically reconstruct weight execution mappings to completely prevent supply floor reverts
+                uint256 chiefBNB = (gainedBNB * accruedChiefTokens) / totalAccrued;
+                uint256 godBNB = gainedBNB - chiefBNB;
+
+                accruedChiefTokens = 0;
+                accruedGodTokens = 0;
+
+                if (chiefBNB > 0) {
+                    payable(currentChief).call { value: chiefBNB, gas: 3000 } ("");
+                }
+
+                if (godBNB > 0) {
+                    payable(tribeGod).call { value: godBNB, gas: 3000} ("");
+                }
+            }
         }
     }
 
@@ -255,20 +285,18 @@ contract OugabugaCoin is IERC20 {
         TradeContext memory ctx;
         ctx.isBuy = (from == pancakePair);
         ctx.isSell = (to == pancakePair);
+        ctx.isLiquidityOp = (ctx.isBuy && to == address(pancakeRouter)) || (ctx.isSell && from == address(pancakeRouter));
 
-        bool takeFee = (ctx.isBuy || ctx.isSell) && !isExcludedFromFees[from] && !isExcludedFromFees[to];
+        bool takeFee = (ctx.isBuy || ctx.isSell) && !isExcludedFromFees[from] && !isExcludedFromFees[to] && !ctx.isLiquidityOp;
 
         if (takeFee) {
-            // Automatically capture the exact launch block on the very first market interaction
-            if (tradingActiveBlock == 0) {
-                tradingActiveBlock = block.number;
-            }
+            require(tradingActive, "Trading is not enabled yet!");
 
-            require(_lastTxBlock[from] < block.number, "One tx per block allowed!");
-            _lastTxBlock[from] = block.number;
-            _lastTxBlock[to] = block.number;
+            // Fixed Anti-Bot protection layer leveraging root caller context
+            require(_lastTxBlock[tx.origin] < block.number, "One tx per block allowed!");
+            _lastTxBlock[tx.origin] = block.number;
 
-            (ctx.currentMaxBuy, ctx.currentMaxSell,) = getCurrentLimits();
+            (ctx.currentMaxBuy, ctx.currentMaxSell, ) = getCurrentLimits();
             _checkLimits(amount, ctx);
 
             if (ctx.isSell && amount >= volcanoTriggerAmount) {
@@ -289,12 +317,17 @@ contract OugabugaCoin is IERC20 {
             emit Transfer(from, to, finalTokens);
 
             if (ctx.isBuy) {
+                if (block.timestamp > chiefRulesUntil) {
+                    highestBuyAmount = 0;
+                }
+
                 if (finalTokens > highestBuyAmount) {
                     currentChief = to;
                     highestBuyAmount = finalTokens;
                     chiefRulesUntil = block.timestamp + CHIEF_DURATION;
                     emit NewChiefCrowned(to, finalTokens);
                 }
+
                 if (finalTokens > globalHighestBuy) {
                     tribeGod = to;
                     globalHighestBuy = finalTokens;
@@ -302,7 +335,6 @@ contract OugabugaCoin is IERC20 {
                 }
             }
         } else {
-            // Handles fee-free internal wallet routing and original contract pool setups flawlessly
             _balances[from] -= amount;
             _balances[to] += amount;
             emit Transfer(from, to, amount);
